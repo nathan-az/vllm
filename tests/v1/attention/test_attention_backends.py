@@ -1687,6 +1687,8 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
         )
         == AttentionCGSupport.UNIFORM_BATCH
     )
+    # XQA rejects head_dim=512, but native decode still graphs uniform batches
+    # unless the KV cache is NVFP4.
     wide_head_kv_cache_spec = FullAttentionSpec(
         block_size=vllm_config.cache_config.block_size,
         num_kv_heads=kv_cache_spec.num_kv_heads,
@@ -1696,6 +1698,17 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
     assert (
         flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
             vllm_config, wide_head_kv_cache_spec
+        )
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
+    assert (
+        flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            replace(
+                wide_head_kv_cache_spec,
+                dtype=torch.uint8,
+                kv_quant_mode=KVQuantMode.NVFP4,
+            ),
         )
         == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
@@ -1808,6 +1821,173 @@ def test_flashinfer_xqa_nvfp4_decode_correctness(
         rows, output = run([q_len] * len(seq_lens), use_cuda_graph)
     assert xqa.called
     torch.testing.assert_close(output, reference[rows], atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer with CUDA is required.",
+)
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("q_len", [1, 5])
+def test_flashinfer_native_spec_decode_correctness(
+    default_vllm_config, q_len, use_cuda_graph, kv_cache_dtype
+):
+    """Spec-decode queries on native decode (head_dim=512, as Gemma 4's global
+    layers, which XQA rejects) run on the tensor-core decode wrapper and match
+    the fa2 prefill over the same cache. The graph case captures on a dummy
+    batch and replays a batch padded with a zero-token request, as the model
+    runner does."""
+    import unittest.mock
+
+    from vllm.config import CUDAGraphMode
+    from vllm.v1.attention.backends import flashinfer as fi
+    from vllm.v1.attention.backends.utils import PerLayerParameters
+
+    if kv_cache_dtype == "fp8" and current_platform.is_device_capability(90):
+        pytest.skip("SM90 FP8 KV keeps spec decode on the prefill path.")
+
+    seq_lens, bs, d, hq, hkv = [40, 300, 1027], 16, 512, 32, 4
+    config = create_vllm_config(
+        model_name="Qwen/Qwen3-0.6B",
+        max_model_len=max(seq_lens),
+        block_size=bs,
+    )
+    config.model_config.model_arch_config = replace(
+        config.model_config.model_arch_config,
+        total_num_attention_heads=hq,
+        total_num_kv_heads=hkv,
+        head_size=d,
+    )
+    # Native decode on every architecture.
+    config.attention_config.use_trtllm_attention = False
+    config.cache_config.cache_dtype = kv_cache_dtype
+    if q_len > 1:
+        config.speculative_config = SpeculativeConfig(
+            method="ngram", num_speculative_tokens=q_len - 1
+        )
+    if use_cuda_graph:
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    is_fp8 = kv_cache_dtype == "fp8"
+    spec = FullAttentionSpec(
+        block_size=bs,
+        num_kv_heads=hkv,
+        head_size=d,
+        dtype=torch.uint8 if is_fp8 else torch.bfloat16,
+        kv_quant_mode=KVQuantMode.FP8_PER_TENSOR if is_fp8 else KVQuantMode.NONE,
+    )
+    assert (
+        fi.FlashInferMetadataBuilder.get_cudagraph_support(config, spec)
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
+
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    # Request i owns consecutive pages from starts[i]; page 0 stays null.
+    pages = [0] + [cdiv(s, bs) for s in seq_lens[:-1]]
+    starts = 1 + torch.tensor(pages).cumsum(0)
+    max_pages = cdiv(max(seq_lens), bs)
+    block_table = (starts[:, None] + torch.arange(max_pages)).int().to(device)
+    # Logical [B, H, N, 2 * d] over a physical NHD allocation.
+    kv_cache = torch.zeros(
+        int(starts[-1]) + max_pages, bs, hkv, 2 * d, dtype=spec.dtype, device=device
+    ).transpose(1, 2)
+    q, k, v = (
+        torch.randn(sum(seq_lens), h, d).bfloat16().to(device) for h in (hq, hkv, hkv)
+    )
+    layer = MockAttentionLayer(device)
+
+    def metadata(query_lens, num_padding_reqs=0):
+        req = torch.repeat_interleave(torch.arange(3), torch.tensor(query_lens))
+        pos = torch.cat([torch.arange(s - n, s) for s, n in zip(seq_lens, query_lens)])
+        rows = pos + torch.tensor([0, *seq_lens]).cumsum(0)[req]
+        # Padding requests have no tokens or KV, and add q_len padding rows
+        # each, as in a batch padded to the next captured graph size.
+        n = num_padding_reqs
+        meta = create_common_attn_metadata(
+            BatchSpec([*seq_lens, *[0] * n], [*query_lens, *[0] * n]), bs, device
+        )
+        meta = replace(
+            meta,
+            num_actual_tokens=len(rows) + n * q_len,
+            block_table_tensor=torch.cat(
+                [block_table, block_table.new_zeros(n, max_pages)]
+            ),
+            slot_mapping=torch.cat(
+                [
+                    (starts[req] * bs + pos).to(device),
+                    torch.full((n * q_len,), -1, device=device),
+                ]
+            ),
+        )
+        return rows, meta
+
+    def forward(meta, query, rows):
+        """Write the rows' KV, then run attention over query."""
+        impl.do_kv_cache_update(layer, k[rows], v[rows], kv_cache, meta.slot_mapping)
+        out = torch.empty_like(query)
+        impl.forward(layer, query, None, None, kv_cache, meta, output=out)
+        return out
+
+    with (
+        set_current_vllm_config(config),
+        unittest.mock.patch.object(
+            fi,
+            "get_per_layer_parameters",
+            lambda *_: {
+                "placeholder": PerLayerParameters(
+                    window_left=-1, logits_soft_cap=0.0, sm_scale=d**-0.5
+                )
+            },
+        ),
+    ):
+        builder = fi.FlashInferMetadataBuilder(spec, ["placeholder"], config, device)
+        impl = fi.FlashInferImpl(
+            num_heads=hq,
+            head_size=d,
+            scale=d**-0.5,
+            num_kv_heads=hkv,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+        # The full prefill writes every token to the cache; its output for
+        # the last q_len tokens of each request is the reference.
+        rows, meta = metadata(seq_lens)
+        reference = forward(meta, q[rows], rows)
+
+        with unittest.mock.patch.object(
+            fi, "fast_plan_decode", wraps=fi.fast_plan_decode
+        ) as plan:
+            if not use_cuda_graph:
+                rows, meta = metadata([q_len] * 3)
+                output = forward(meta, q[rows], rows)
+            else:
+                # Capture on a dummy batch of four requests whose only KV is
+                # their q_len tokens on the null page, as the runner does.
+                dummy = replace(
+                    create_common_attn_metadata(
+                        BatchSpec([q_len] * 4, [q_len] * 4), bs, device
+                    ),
+                    block_table_tensor=block_table.new_zeros(4, max_pages),
+                    slot_mapping=torch.full((4 * q_len,), -1, device=device),
+                )
+                query = torch.zeros(4 * q_len, hq, d, dtype=q.dtype, device=device)
+                output = torch.empty_like(query)
+                captured = builder.build(0, dummy)
+                impl.forward(layer, query, None, None, kv_cache, captured, output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    impl.forward(layer, query, None, None, kv_cache, captured, output)
+                # Replay three real requests plus one padding request: the
+                # rebuild replans the captured wrapper in place.
+                rows, meta = metadata([q_len] * 3, num_padding_reqs=1)
+                builder.build(0, meta)
+                query[: len(rows)] = q[rows]
+                graph.replay()
+    assert plan.call_args.kwargs["q_len_per_req"] == q_len
+    tol = 6e-2 if is_fp8 else 2e-2
+    torch.testing.assert_close(output[: len(rows)], reference[rows], atol=tol, rtol=tol)
 
 
 if current_platform.is_rocm():
