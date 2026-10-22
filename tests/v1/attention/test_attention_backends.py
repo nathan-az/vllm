@@ -1926,7 +1926,7 @@ def test_flashinfer_native_spec_decode_correctness(
         """Write the rows' KV, then run attention over query."""
         impl.do_kv_cache_update(layer, k[rows], v[rows], kv_cache, meta.slot_mapping)
         out = torch.empty_like(query)
-        impl.forward(layer, query, None, None, kv_cache, meta, output=out)
+        impl.forward(layer, query, None, None, kv_cache, builder.build(0, meta), out)
         return out
 
     with (
